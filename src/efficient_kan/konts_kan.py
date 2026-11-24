@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from .spline import basis, second_derivative
 import math
 import torch.nn as nn
 import random
@@ -90,38 +91,16 @@ class KANLinear(torch.nn.Module):
 
 
 
-    def b_splines(self, x: torch.Tensor):
-        """
-        Compute the B-spline bases for the given input tensor.
-        Args:
-            x (torch.Tensor): Input tensor of shape (batch_size, in_features).
-        Returns:
-            torch.Tensor: B-spline bases tensor of shape (batch_size, in_features, grid_size + spline_order).
-        """
-        
-        # grid = (self.grid).repeat(self.num_neurons_in_g, 1, 1)
-        
-        grid = (self.grid + self.grid_bias)
-        grid = torch.sort(grid, dim=2, descending=False).values.repeat(self.num_neurons_in_g, 1, 1)
-        grid = torch.clamp(grid, self.grid_range[0] - self.h * self.spline_order, self.grid_range[-1] + self.h * self.spline_order)
-        
-        B, E = x.shape
-        x = x.contiguous().reshape(B, self.num_neurons_in_g, self.groups).unsqueeze(-1)
-        bases = ((x >= grid[:, :, :-1]) & (x < grid[:, :, 1:])).to(x.dtype)
-        for k in range(1, self.spline_order + 1):
-            bases = (
-                (x - grid[:, :, : -(k + 1)])
-                / (grid[:, :, k:-1] - grid[:, :, : -(k + 1)])
-                * bases[:, :, :, :-1]
-            ) + (
-                (grid[:, :, k + 1 :] - x)
-                / (grid[:, :, k + 1 :] - grid[:, :, 1:(-k)])
-                * bases[:, :, :, 1:]
-            )
-            
-        return bases.contiguous()
+    def _knots(self):
+        knots = (self.grid + self.grid_bias).sort(dim=-1).values
+        return knots.clamp(self.grid_range[0] - self.h * self.spline_order,
+                           self.grid_range[-1] + self.h * self.spline_order)
 
+    def _group_inputs(self, x):
+        return x.reshape(-1, self.num_neurons_in_g, self.groups, 1)
 
+    def b_splines(self, x):
+        return basis(self._group_inputs(x), self._knots(), self.spline_order)
 
     def curve2coeff(self, x: torch.Tensor, y: torch.Tensor):
         """
@@ -150,18 +129,18 @@ class KANLinear(torch.nn.Module):
         return result.contiguous()
 
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, return_curvature=False):
         assert x.size(-1) == self.in_features
-        original_shape = x.shape
-        x = x.reshape(-1, self.in_features)
-        output = self.b_splines(x)
-        output = torch.einsum('begz,qgz->beg', output, self.spline_lin_c).reshape(original_shape[0], -1)
-        output = torch.matmul(output, self.spline_weight) 
+        grouped = self._group_inputs(x)
+        knots = self._knots()
+        values = basis(grouped, knots, self.spline_order)
+        activation = (values * self.spline_lin_c).sum(-1).reshape_as(x)
         if self.need_relu:
-            shortcut_x = torch.matmul(self.shortcut(x), self.spline_weight)
-            # shortcut_x = torch.matmul(self.shortcut(x), self.base_weight)
-            output = output + shortcut_x
-        output = output.reshape(*original_shape[:-1], self.out_features)
+            activation = activation + self.shortcut(x)
+        output = activation @ self.spline_weight
+        if return_curvature:
+            d2 = second_derivative(grouped, knots, self.spline_lin_c, self.spline_order)
+            return output, d2.sum(dim=(-1, -2)).mean()
         return output
 
 
@@ -205,27 +184,28 @@ class Knots_KAN(torch.nn.Module):
     
     
     
-    def forward(self, x: torch.Tensor, update_grid=False, normalize=False):
+    def forward(self, x: torch.Tensor, update_grid=False, normalize=False, return_curvature=False):
         if normalize:
             means = x.mean(1, keepdim=True).detach()
             x = x - means
             stdev = torch.sqrt(torch.var(x, dim=1, keepdim=True, unbiased=False)+ 1e-6).detach() 
             x /= stdev
         
-        x = self.layer_norm[0](x)
-        enc_x = self.layers[0](x)
-        hid_x = enc_x
-        
-        for layer, layernorm in zip(self.layers[1:-1], self.layer_norm[1:-1]):
-            hid_x = layernorm(hid_x)
-            hid_x = layer(hid_x)
-            
-        hid_x = self.layer_norm[-1](hid_x)
-        hid_x = self.layers[-1](hid_x)
-        
+        curvature = x.new_zeros(())
+        hid_x = x
+        for layer, norm in zip(self.layers, self.layer_norm):
+            hid_x = norm(hid_x)
+            if return_curvature:
+                hid_x, term = layer(hid_x, return_curvature=True)
+                curvature = curvature + term
+            else:
+                hid_x = layer(hid_x)
+
         if normalize:
             hid_x = hid_x * stdev
             hid_x = hid_x + means
+        if return_curvature:
+            return hid_x, curvature
         return hid_x
 
 

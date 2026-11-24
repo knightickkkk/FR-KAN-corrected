@@ -1,0 +1,72 @@
+\documentclass[11pt]{article}
+\usepackage[margin=0.85in]{geometry}
+\usepackage{amsmath,amssymb,booktabs,tabularx,hyperref,xcolor}
+\hypersetup{colorlinks=true,urlcolor=blue!50!black}
+\setlength{\parindent}{0pt}\setlength{\parskip}{5pt}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\begin{document}
+{\Large\bfseries FR-KAN implementation corrections}\\[3pt]
+{\large Repeated knots and the input-curvature objective}\\
+Based on \href{https://github.com/IcurasLW/FR-KAN/tree/3608a8aa44575fac587bc5ab6cff303da05cc166}{IcurasLW/FR-KAN, commit 3608a8a}. Paper reference: Section 5.3, Eq. (8), p. 5 of the supplied PDF.
+\section*{What the previous loss measured}
+For a task loss $J$ and a layer's vector of spline coefficients $c$, the upstream trainers formed $g=\nabla_c J$, differentiated $\sum_j g_j$ with respect to $c$, and took its Euclidean norm. This measures a Hessian--vector product $H_c(J)\mathbf{1}$. Its value can change when the labels or the task loss change, even for the same fitted spline and the same batch. The four command-line trainers also skipped the final layer. The function-fitting notebook included it.
+\section*{How Equation (8) becomes executable}
+The equation sums signed second derivatives with respect to input. Its text calls $c_{j,i}$ a combination weight. A learned scalar coefficient is independent of the input, so its literal input derivative vanishes. This patch interprets the indexed quantity as the coefficient's \emph{contribution} to the learned activation, $c_{g,j}B_{j,p}(u; t_g)$. Here $p$ is spline degree, $t_g$ is the current sorted and clamped knot vector, and $g=g(i)$ is the group assigned to feature $i$. The index $j$ runs over the actual basis coefficients, including the padded bases used in the forward pass.
+\[
+ S_{\ell i}(u)=\sum_j c_{\ell,g(i),j} B_{j,p}(u;t_{\ell,g(i)}),\qquad
+ R=\frac{1}{B}\sum_{b=1}^{B}\sum_\ell\sum_i
+ S_{\ell i}''(u_{b\ell i}),\qquad L=J+\lambda R.
+\]
+The evaluation points $u$ are the layer's actual normalized inputs. $B$ counts input rows (including flattened leading dimensions). Each input feature contributes once, even when several features share coefficients. All FR-KAN layers contribute. The SiLU shortcut and subsequent output projection lie outside $S$. Automatic differentiation of $L$ through $R$ still reaches upstream parameters. These choices specify layer coverage, evaluation points and batch reduction that Eq. (8) leaves implicit.
+
+\textbf{Interpretation of the sign.} Equation (8) prints a signed sum. Positive and negative curvature can cancel, and minimizing a signed sum can reward negative curvature. For example, $S(u)=-u^2$ contributes $-2$ per input. A squared-curvature roughness penalty would solve a different optimization problem. Benchmark improvements cannot be inferred from matching the derivative.
+\newpage
+\section*{Repeated knots and the derivative recurrence}
+Sorting learned knots and clipping them to the allowed range can produce exact ties. A zero-width span contributes zero in the Cox--de Boor recurrence. The new helper masks the denominator \emph{before} division and returns zero for that term. This avoids creating invalid intermediates in the computation graph. Finite nonzero spans retain their actual width, including very small spans. Consequently, a near collision can still produce large genuine derivatives.
+
+Writing $N_{j,k}$ for the degree-$k$ basis, the implementation uses
+\[
+ N'_{j,k}=k\left(\frac{N_{j,k-1}}{t_{j+k}-t_j}-
+                       \frac{N_{j+1,k-1}}{t_{j+k+1}-t_{j+1}}\right).
+\]
+Starting with degree-$(p-2)$ basis values, it applies this identity at degrees $p-1$ and $p$, then sums the resulting second derivatives against $c$. Retaining the full padded basis matters for samples lying outside the central grid. For degree zero or one, the ordinary within-span second derivative is zero. The half-open interval convention selects the piece to the right at an interior knot. At a nonsmooth repeated knot this is a piecewise evaluation convention; a classical second derivative need not exist there.
+
+\section*{Where the implementation changed}
+\begin{tabularx}{\linewidth}{@{}p{.37\linewidth}X@{}}\toprule
+File or entry point & Change \\ \midrule
+\code{src/efficient_kan/spline.py} & Shared safe division, basis evaluation, and analytic input second derivative.\\
+\code{src/efficient_kan/konts_kan.py} & The free-knot layer evaluates the activation and optional curvature on the same effective knots. The network visits each layer once and accumulates the batch reductions. The tensor-only prediction interface remains available.\\
+\code{src/efficient_kan/kan.py} & Fixed-grid baseline uses the same repeated-knot convention. Its separate entropy regularizer handles all-zero coefficient mass and zero-probability entries.\\
+\code{main_cv.py}, \code{main_nlp.py}, \code{main_mm.py}, \code{main_ts.py} & The training step requests curvature for FR-KAN when smoothing is enabled and its weight is nonzero. Adds the weighted scalar once. Uses the FR-KAN module shipped in this checkout. Time series keeps its input/output normalization.\\
+\code{Function_Fitting.ipynb} & The trainer uses the same curvature path. Corrects the FR-KAN and MLP import spelling, handles zero feature scale, and computes RMSE from the existing MSE.\\
+\bottomrule\end{tabularx}
+\newpage
+\section*{Other zero-denominator cases}
+\begin{tabularx}{\linewidth}{@{}p{.37\linewidth}X@{}}\toprule
+File & Result for a degenerate input \\ \midrule
+\code{ts_utils/metrics.py} & RSE, ND and percentage errors give zero for a perfect zero-scale case and infinity for a nonzero error at zero scale. Symmetric percentage error assigns zero to a pair of zeros. Correlation with a zero denominator explicitly gives NaN (undefined). Percentage errors now use the actual denominator for nonzero targets.\\
+\code{ts_utils/tools.py} & The local standard scaler uses scale one for constant features in both transform directions.\\
+\code{src/efficient_kan/rbf_kan.py} & Reports an invalid zero RBF width at construction. A single grid point needs an explicit nonzero width.\\
+\bottomrule\end{tabularx}
+\section*{Running the corrected objective}
+Append \code{--model Knot_KAN --smooth --smooth_lambda 0.01} to the existing experiment arguments; replace an existing value if the launcher already supplies that option. The value 0.01 is an example. The scripts retain their own defaults (0.01 for CV, NLP and TS; 0.001 for multimodal). The notebook uses \code{reg=True} and \code{lamb}. Validation continues to measure task performance. Existing dataset and experiment output paths may need adjustment for your machine.
+
+For a dataset-free training step from the repository root:
+\begin{verbatim}
+import torch
+from src.efficient_kan.konts_kan import Knots_KAN
+
+model = Knots_KAN([4, 8, 2], groups=2)
+x, y = torch.randn(16, 4), torch.randn(16, 2)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+optimizer.zero_grad()
+prediction, R = model(x, return_curvature=True)
+loss = (prediction - y).square().mean() + 0.01 * R
+loss.backward()
+optimizer.step()
+\end{verbatim}
+\section*{Verification and reproduction}
+From the repository root, install the package with \code{python -m pip install -e .}, then run \code{python -m pytest -q}. The new \code{tests/test_spline_curvature.py} compares analytic curvature and its parameter gradients with a twice-differentiated forward pass on nonuniform knots. It checks known polynomials, exact collisions, tiny nonzero spans, grouped multilayer training, finite entropy gradients, reporting ratios and RBF widths. The test suite includes the upstream simple-math fitting test.
+
+Validation used CPU PyTorch 2.15.0. A two-epoch run of the notebook trainer used 16 training and 16 test examples from its symbolic function-fitting task. These checks cover the objective and its gradients. Full dataset benchmarks, GPU comparisons, and a reproduction of the paper's accuracy tables were outside this validation.
+\end{document}

@@ -17,7 +17,13 @@ class RadialBasisFunction(nn.Module):
         super().__init__()
         grid = torch.linspace(grid_min, grid_max, num_grids)
         self.grid = torch.nn.Parameter(grid, requires_grad=False)
-        self.denominator = denominator or (grid_max - grid_min) / (num_grids - 1)
+        if denominator is None:
+            if num_grids < 2:
+                raise ValueError("An automatic RBF width requires at least two grid points")
+            denominator = (grid_max - grid_min) / (num_grids - 1)
+        if denominator == 0:
+            raise ValueError("RBF width must be nonzero")
+        self.denominator = denominator
 
     def forward(self, x):
         return torch.exp(-((x[..., None] - self.grid) / self.denominator) ** 2)

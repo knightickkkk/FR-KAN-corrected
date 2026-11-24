@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+from .spline import basis, divide_or_zero
 import math
 import torch.nn as nn
 import random
@@ -99,17 +100,7 @@ class KANLinear(torch.nn.Module):
             self.grid
         )  # (in_features, grid_size + 2 * spline_order + 1)
         x = x.unsqueeze(-1)
-        bases = ((x >= grid[:, :-1]) & (x < grid[:, 1:])).to(x.dtype)
-        for k in range(1, self.spline_order + 1):
-            bases = (
-                (x - grid[:, : -(k + 1)])
-                / (grid[:, k:-1] - grid[:, : -(k + 1)])
-                * bases[:, :, :-1]
-            ) + (
-                (grid[:, k + 1 :] - x)
-                / (grid[:, k + 1 :] - grid[:, 1:(-k)])
-                * bases[:, :, 1:]
-            )
+        bases = basis(x, grid, self.spline_order)
 
         assert bases.size() == (
             x.size(0),
@@ -238,8 +229,8 @@ class KANLinear(torch.nn.Module):
         """
         l1_fake = self.spline_weight.abs().mean(-1)
         regularization_loss_activation = l1_fake.sum()
-        p = l1_fake / regularization_loss_activation
-        regularization_loss_entropy = -torch.sum(p * p.log())
+        p = divide_or_zero(l1_fake, regularization_loss_activation)
+        regularization_loss_entropy = -torch.sum(p * torch.where(p > 0, p, 1).log())
         return (
             regularize_activation * regularization_loss_activation
             + regularize_entropy * regularization_loss_entropy

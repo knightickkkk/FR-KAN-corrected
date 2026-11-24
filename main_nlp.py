@@ -1,4 +1,4 @@
-from efficient_kan.konts_kan import *
+from src.efficient_kan.konts_kan import *
 from src.efficient_kan.kan import KAN
 from src.efficient_kan.rational_kan import Rational_KAN
 
@@ -145,16 +145,15 @@ for k in range(fold):
                 b_s = text_embed.shape[0]
                 text_embed = text_embed.view(b_s, -1).to(device)
                 optimizer.zero_grad()
-                output = model(text_embed)
+                smoothing = args.model == 'Knot_KAN' and args.smooth and args.smooth_lambda != 0
+                if smoothing:
+                    output, curvature = model(text_embed, return_curvature=True)
+                else:
+                    output = model(text_embed)
                 loss = criterion(output, labels.to(device))
                 
-                if args.model == 'Knot_KAN' and args.smooth:
-                    l2_norm = 0
-                    for layer in model.layers[:-1]:
-                        f_derive = torch.autograd.grad(loss, layer.spline_lin_c, create_graph=True)[0]
-                        s_derive = torch.autograd.grad(f_derive.sum(), layer.spline_lin_c, create_graph=True)[0]
-                        l2_norm += torch.norm(s_derive, p=2)
-                    loss += args.smooth_lambda * l2_norm
+                if smoothing:
+                    loss = loss + args.smooth_lambda * curvature
                     
                 loss.backward()
                 max_norm = 1.0  # Maximum allowed norm of gradients

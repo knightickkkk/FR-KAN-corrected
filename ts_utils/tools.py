@@ -82,7 +82,7 @@ class dotdict(dict):
 class StandardScaler():
     def __init__(self, mean, std):
         self.mean = mean
-        self.std = std
+        self.std = np.where(np.asarray(std) == 0, 1, std)
 
     def transform(self, data):
         return (data - self.mean) / self.std

@@ -1,4 +1,4 @@
-from efficient_kan.konts_kan import *
+from src.efficient_kan.konts_kan import *
 from src.efficient_kan.kan import KAN
 from src.efficient_kan.rational_kan import Rational_KAN
 from src.efficient_kan.rbf_kan import RBF_KAN
@@ -203,7 +203,11 @@ for k in range(fold):
                     
                 x = torch.concat([x_1, x_2], dim=1)
                 optimizer.zero_grad()
-                output = model(x)
+                smoothing = args.model == 'Knot_KAN' and args.smooth and args.smooth_lambda != 0
+                if smoothing:
+                    output, curvature = model(x, return_curvature=True)
+                else:
+                    output = model(x)
                 loss = criterion(output, labels)
                 
                 if args.data_name == 'IMDB':
@@ -214,13 +218,8 @@ for k in range(fold):
                 else:
                     train_metric = (output.argmax(dim=1) == labels.to(device)).float().mean()
                     
-                if args.model == 'Knot_KAN' and args.smooth:
-                    l2_norm = 0
-                    for layer in model.layers[:-1]:
-                        f_derive = torch.autograd.grad(loss, layer.spline_lin_c, create_graph=True)[0]
-                        s_derive = torch.autograd.grad(f_derive.sum(), layer.spline_lin_c, create_graph=True)[0]
-                        l2_norm += torch.norm(s_derive, p=2)
-                    loss += args.smooth_lambda * l2_norm
+                if smoothing:
+                    loss = loss + args.smooth_lambda * curvature
                     
                     
                 loss.backward()
